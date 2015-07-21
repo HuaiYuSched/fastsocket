@@ -35,6 +35,9 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
 #include "server.h"
 
 struct worker_data *wdata;
@@ -45,6 +48,7 @@ int enable_verbose = 0;
 int enable_proxy = 0;
 int enable_keepalive = 0;
 int enable_debug = 0;
+int enable_ssl = 0;
 int process_mode = 0;
 int specified_log_file = 0;
 FILE *log_file = NULL;
@@ -55,11 +59,15 @@ int pfd;
 			printf("Worker[%lu] %s:%d\t" fmt, syscall(__NR_gettid),__FUNCTION__ , __LINE__, ## args); \
 	})
 
+SSL_CTX *ssl_ctx;
+
 struct listen_addr la[MAX_LISTEN_ADDRESS];
 struct proxy_addr pa[MAX_PROXY_ADDRESS];
 int la_num;
 int pa_num;
 char log_path[64] = {0};
+char pem_path[64] = {0};
+char privkey_path[64] = {0};
 
 static void process_read(struct conn_context *ctx);
 static void process_write(struct conn_context *ctx);
@@ -109,6 +117,8 @@ int main(int argc, char *argv[])
 	printf("   -v: enable verbose mode\n	   [default is off]\n");
 	printf("   -d: enable debug mode\n	   [default is off]\n");
 	printf("   -o: specify log file\n	   [default is ./demo.log]\n");
+  printf("   -s: enable secure socket layer\n	   [default is off]\n");
+
 	printf("\n");
 
 again:
@@ -157,6 +167,12 @@ again:
 		argc -= 2;
 		goto again;
 	}
+  if (argc >= 2 && strcmp(argv[1], "-s") ==0) {
+    enable_ssl = 1;
+    argv ++;
+    argc --;
+    goto again;
+  }
 
 	if (argc >= 3 && strcmp(argv[1], "-a") == 0) {
 		int i ;
@@ -250,6 +266,13 @@ again:
 		printf("\n");
 	}
 
+  if(strlen(pem_path)==0)
+		strncpy(pem_path, "cert.pem", sizeof(pem_path));
+
+  if(strlen(privkey_path)==0)
+		strncpy(privkey_path, "privkey.pem", sizeof(privkey_path));
+
+
 	if (enable_debug)
 		printf("Debug Mode is enabled\n\n");
 
@@ -260,6 +283,7 @@ again:
 		printf("Process Mode is enable with %d workers\n\n", num_workers);
 
 	init_log();
+  if(enable_ssl) 	init_ssl();
 	init_server();
 	init_signal();
 
@@ -269,6 +293,43 @@ again:
 	do_stats();
 
 	return 0;
+}
+
+void init_ssl(void){
+  SSL_library_init();
+  SSL_load_error_strings();
+  OpenSSL_add_all_algorithms();
+
+
+  ssl_ctx = create_ssl_ctx();
+  SSL_CTX_set_mode(ssl_ctx,SSL_MODE_AUTO_RETRY);
+  printf("init ssl successful\n");
+}
+
+/*
+ * This function will create a SSL context in global scope.
+ * Then fill the ctx with pem file.
+ */
+SSL_CTX * create_ssl_ctx(void){
+  SSL_CTX * ssl_ctx = SSL_CTX_new(SSLv23_server_method());
+  if( !ssl_ctx){
+    perror("Unable to Create SSL context");
+    ERR_print_errors_fp(stderr);
+    exit_cleanup();
+  }
+  if(SSL_CTX_use_certificate_file(ssl_ctx,pem_path,SSL_FILETYPE_PEM) < 0){
+    ERR_print_errors_fp(stderr);
+    exit_cleanup();
+  }
+  if(SSL_CTX_use_PrivateKey_file(ssl_ctx,privkey_path,SSL_FILETYPE_PEM) < 0){
+    ERR_print_errors_fp(stderr);
+    exit_cleanup();
+  }
+  if(!SSL_CTX_check_private_key(ssl_ctx)){
+    ERR_print_errors_fp(stdout);
+    exit_cleanup();
+  }
+  return ssl_ctx;
 }
 
 void init_signal(void)
@@ -526,6 +587,13 @@ char *http_200_keepalive="HTTP/1.0 200 OK\r\n"
 	"\r\n"
 	"<html><body><h1>200 OK</h1>\nEverything is fine.\n</body></html>\n";
 
+char *https_200="HTTPS/1.0 200 OK\r\n"
+	"Cache-Control: no-cache\r\n"
+	"Connection: close\r\n"
+	"Content-Type: text/html\r\n"
+	"\r\n"
+	"<html><body><h1>200 OK</h1>\nEverything is fine.\n</body></html>\n";
+
 char *http_response;
 int http_response_len;
 
@@ -533,6 +601,7 @@ static void process_close(struct conn_context *ctx)
 {
 	int fd, end_fd, ep_fd, ret;
 	struct epoll_event evt;
+  SSL *ssl = ctx->ssl;
 
 	ep_fd = ctx->ep_fd;
 	fd = ctx->fd;
@@ -541,6 +610,20 @@ static void process_close(struct conn_context *ctx)
 	evt.events = EPOLLHUP | EPOLLERR;
 	evt.data.ptr = ctx;
 
+  if(enable_ssl){
+    ret = SSL_shutdown(ssl);
+    if(1!=ret){
+      int sslerr = SSL_get_error(ssl, ret);
+      switch(sslerr){
+        case SSL_ERROR_WANT_READ:
+          break;
+        case SSL_ERROR_WANT_WRITE:
+          break;
+      }
+    SSL_free(ssl);
+    ctx->ssl = NULL;
+    }
+  }
 
 	if (ctx->fd_added) {
 		ret = epoll_ctl(ep_fd, EPOLL_CTL_DEL, fd, &evt);
@@ -862,12 +945,26 @@ static void process_write(struct conn_context *client_ctx)
 		goto free_back;
 	}
 
-	ret = write(fd, http_response, http_response_len);
-	if (ret < 0) {
-		wdata[cpu_id].write_cnt++;
-		perror("process_write() can't write client socket");
-		goto free_back;
-	}
+  if(enable_ssl){
+  	ret = SSL_write(client_ctx->ssl, http_response, http_response_len);
+    if(ret <= 0){
+      int sslerr = SSL_get_error(client_ctx->ssl, ret);
+      switch(sslerr){
+        case SSL_ERROR_WANT_READ:
+          break;
+        case SSL_ERROR_WANT_WRITE:
+          break;
+      }
+    }
+  }
+  else{
+  	ret = write(fd, http_response, http_response_len);
+  	if (ret < 0) {
+  		wdata[cpu_id].write_cnt++;
+  		perror("process_write() can't write client socket");
+  		goto free_back;
+  	}
+  }
 
 	print_d("Write %d to socket %d\n", ret, fd);
 
@@ -922,16 +1019,29 @@ static void process_read(struct conn_context *client_ctx)
 
 	print_d("Process read event[%02x] on socket %d\n", events, fd);
 
-	ret = read(fd, buf, MAX_BUFSIZE);
-	if (ret < 0) {
-		wdata[cpu_id].read_cnt++;
-		perror("process_read() can't read client socket");
-		goto free_back;
-	} else if (ret == 0) {
-		goto free_back;
-		print_d("Socket %d is closed\n", fd);
-	}
-
+  if(enable_ssl){
+    ret = SSL_read(client_ctx->ssl, buf, MAX_BUFSIZE);
+    if(ret <= 0){
+      int sslerr = SSL_get_error(client_ctx->ssl, ret);
+      switch(sslerr){
+        case SSL_ERROR_WANT_READ:
+          break;
+        case SSL_ERROR_WANT_WRITE:
+          break;
+      }
+    }
+  }
+  else {
+  	ret = read(fd, buf, MAX_BUFSIZE);
+  	if (ret < 0) {
+  		wdata[cpu_id].read_cnt++;
+  		perror("process_read() can't read client socket");
+  		goto free_back;
+  	} else if (ret == 0) {
+  		goto free_back;
+  		print_d("Socket %d is closed\n", fd);
+  	}
+  }
 	client_ctx->data_len = ret;
 
 	print_d("Read %d from socket %d\n", ret, fd);
@@ -959,6 +1069,81 @@ free_back:
 
 back:
 	return;
+}
+
+static void process_handshake(struct conn_context * client_ctx)
+{
+  int ep_fd, fd;
+  int events = client_ctx->events;
+  struct epoll_event evt;
+
+  int ret;
+  int cpu_id = client_ctx->cpu_id;
+  SSL *ssl = NULL;
+
+  ep_fd = client_ctx->ep_fd;
+  fd = client_ctx->fd;
+
+  ssl = client_ctx->ssl;
+  if( ssl == NULL){
+    if((ssl = SSL_new(ssl_ctx)) == 0){
+      print_d("SSL new failed\n");
+      goto free_back;
+    }
+    if( SSL_set_fd(ssl,fd) == 0){
+      print_d("SSL set fd failed\n");
+      goto free_back;
+    }
+    SSL_set_accept_state(ssl);
+    client_ctx->ssl = ssl;
+  }
+
+  ret = SSL_do_handshake(ssl);
+
+  if(ret == -1){
+    print_d("SSL handshake error");
+    ret = SSL_get_error(ssl,ret);
+ 
+    switch(ret){
+			case SSL_ERROR_WANT_READ:
+        printf("WANT_READ\n");
+        evt.events |= EPOLLIN;
+        evt.events &= ~EPOLLOUT;
+        evt.data.ptr = client_ctx;
+	      break;
+			case SSL_ERROR_WANT_WRITE:
+        printf("WANT_WRITE\n");
+        evt.events |= EPOLLOUT;
+        evt.events &= ~EPOLLIN;
+        evt.data.ptr = client_ctx;
+        break;
+      default :
+        printf("handshake error\n");
+         break;
+    }
+  }
+  else{
+    evt.events = EPOLLOUT | EPOLLHUP | EPOLLERR;
+    evt.data.ptr = client_ctx;
+    client_ctx->handler = process_write;
+  }
+
+  ret = epoll_ctl(ep_fd, EPOLL_CTL_MOD, fd, &evt);
+  if(ret < 0){
+    perror("Unable to add client socket read event to epoll");
+    goto free_back;
+  }
+
+  goto out;
+  //FIXME
+  //What should I do to free SSL?
+free_back:
+  print_d("cpu[%d] close socket %d\n",cpu_id, client_ctx->fd);
+
+  process_close(client_ctx);
+  free_context(client_ctx);
+out:
+  return;
 }
 
 static void process_accept(struct conn_context * listen_ctx)
@@ -1001,10 +1186,12 @@ static void process_accept(struct conn_context * listen_ctx)
 	assert(client_ctx);
 
 	client_ctx->fd = client_fd;
-
-	if (enable_proxy)
+  //FIXME not support proxy with ssl now
+	if (enable_proxy)                           
 		client_ctx->handler = process_read_frontend;
-	else
+	else if (enable_ssl)
+    client_ctx->handler = process_handshake;  //This is for SSL handshake before read and write;
+  else
 		client_ctx->handler = process_read;
 
 	client_ctx->cpu_id = listen_ctx->cpu_id;

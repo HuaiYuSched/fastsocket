@@ -54,6 +54,8 @@ struct context_pool {
 		struct context_pool *pool;
 		int next_idx;
 		char buf[MAX_BUFSIZE];
+
+    SSL * ssl;
 	} *arr;
 };
 
@@ -83,5 +85,8 @@ void exit_cleanup(void);
 void stop_threads(void);
 void stop_workers(void);
 
-#endif
 
+void init_ssl(void);
+SSL_CTX * create_ssl_ctx(void);
+
+#endif

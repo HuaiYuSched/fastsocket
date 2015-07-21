@@ -3,6 +3,12 @@
 CC = gcc
 CFLAGS = -Wall -g 
 LDFLAGS = -pthread
+USE_SSL = USE_SSL
+
+ifdef USE_SSL
+LDFLAGS +=  -g -lssl -lcrypto
+CFLAGS += -D USE_SSL
+endif
 
 all: server
 
