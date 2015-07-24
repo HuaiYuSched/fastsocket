@@ -56,6 +56,9 @@ address[ip:port]. Multiple backend addresses can be added.
 - -k: Enable HTTP keepalive. Currently it only works in the server 
 mode.
 	- Default is disabled.
+- -s: Enable SSL support. Currently it only works in the server 
+mode.
+	- Default is disabled.
  
 ## EXAMPLES ##
 
@@ -108,6 +111,45 @@ can be launched by the following command (12 instances in the example).
 
 	`[root@localhost ~]# N=12; for i in $(seq 1 $N); do ab -n 1000000 -c 100 http://10.0.0.2:80/ > /dev/null 2>&1; done`
 
+### SSL SUPPORT ###
+
+To enable ssl support, you need install openssl-devel in your system first.
+```
+$sudo yum install openssl-devel openssl-libs
+```
+
+In SSL example, you need two file in work directory, 'cert.pem' as server certificate file and 'privkey.pem' as private key file, here is the approach to generate this two file with openssl tools.
+
+```
+#The prerequisite to generate the two file is build your CA.
+#if the CA is already build in your system, skip this step.
+#generate root key
+$cd /etc/pki/CA/
+$(umask 077; openssl genrsa -out private/cakey.pem 2048)
+
+#edit your configure file
+$(editor) /etc/pki/tls/openssl.cnf
+
+#generate root certificate file by self-sign
+$openssl req -new -x509 -key private/cakey.pem -out cacert.pem
+
+#change directory to $fastsocket/demo
+$cd $(fastsocket)/demo
+
+#generate private key for server with password protect;
+$openssl genrsa -des3 -out privkey.pem 2048
+#Create certification request from private key.
+$openssl req -new -key privkey.pem -out cert.csr
+
+#use the request file to sign certificate file
+$openssl ca -in cert.csr -out cert.pem
+
+```
+
+After generate this two files,cert.pem and privkey.pem, you can run the server with -s optional to enable the ssl support.   
+However, when you run the server, it might request the password of your private key.  
+As for the client, if you are using the http_load, you need to modifide the Makefile to uncomment the SSL macro and recompile it. After that, you can just edit the url.txt file in http_load directory with https url.    
+Also, as said before, this server is so simple and stupid. so if you want to write or use your own client to test it, please do not send package and just receive from it.    
 
 ### PROXY MODE EXAMPLE ###
 
